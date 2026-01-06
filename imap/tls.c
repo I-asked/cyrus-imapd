@@ -102,6 +102,7 @@
 
 #include <sys/types.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 #include <syslog.h>
@@ -143,20 +144,71 @@ static int verify_error = X509_V_OK;
 
 static SSL_CTX *s_ctx = NULL, *c_ctx = NULL;
 
+static struct s_cert {
+    char *dom;
+    char *key;
+    char *cer;
+} *s_certs = NULL;
+static int s_certs_cap = 0, s_certs_num = 0;
+
 static int tls_serverengine = 0; /* server engine initialized? */
 static int tls_clientengine = 0; /* client engine initialized? */
 static int do_dump = 0;         /* actively dumping protocol? */
+
+
+static int cert_compare(const void *a, const void *b) {
+    const struct s_cert *c_a = a, *c_b = b;
+    return strcasecmp(c_a->dom, c_b->dom);
+}
+
+
+static int i_set_cert_stuff(SSL *ssl,
+                            const char *cert_file, const char *key_file)
+{
+    int err = 0;
+    if (!cert_file || !key_file) return 1;
+
+    ERR_clear_error();
+
+    if (SSL_use_certificate_chain_file(ssl, cert_file) <= 0) {
+        err = ERR_get_error();
+        syslog(LOG_ERR, "unable to get certificate from '%s': %s",
+               cert_file, ERR_reason_error_string(err));
+        goto done;
+    }
+    if (SSL_use_PrivateKey_file(ssl, key_file, SSL_FILETYPE_PEM) <= 0) {
+        err = ERR_get_error();
+        syslog(LOG_ERR, "unable to get private key from '%s': %s",
+               key_file, ERR_reason_error_string(err));
+        goto done;
+    }
+    /* Now we know that a key and cert have been set against
+     * the SSL context */
+    if (!SSL_check_private_key(ssl)) {
+        err = ERR_get_error();
+        syslog(LOG_ERR, "Private key '%s' does not match public key '%s': %s",
+               key_file, cert_file, ERR_reason_error_string(err));
+        goto done;
+    }
+
+done:
+    return err;
+}
 
 
 EXPORTED int tls_enabled(void)
 {
     const char *val;
 
-    val = config_getstring(IMAPOPT_TLS_SERVER_CERT);
-    if (!val || !strcasecmp(val, "disabled")) return 0;
+    val = config_getstring(IMAPOPT_TLS_SERVER_CERT_DIR);
 
-    val = config_getstring(IMAPOPT_TLS_SERVER_KEY);
-    if (!val || !strcasecmp(val, "disabled")) return 0;
+    if (!val || !*val) {
+        val = config_getstring(IMAPOPT_TLS_SERVER_CERT);
+        if (!val || !strcasecmp(val, "disabled")) return 0;
+
+        val = config_getstring(IMAPOPT_TLS_SERVER_KEY);
+        if (!val || !strcasecmp(val, "disabled")) return 0;
+    }
 
     if (config_getswitch(IMAPOPT_CHATTY))
             xsyslog(LOG_INFO, "TLS is available.", NULL);
@@ -259,13 +311,17 @@ static int servername_callback(SSL *ssl, int *ad __attribute__((unused)),
                                void *arg __attribute__((unused)))
 {
     const char *servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-
-    if (servername) {
-        syslog(LOG_DEBUG, "TLS Server Name Indication (SNI) Extension: \"%s\"",
-               servername);
+    int all_ok = !s_certs_num;
+    if (servername && s_certs_num) {
+        struct s_cert key = { .dom = servername };
+        const struct s_cert *pcert = bsearch(&key, s_certs, s_certs_num, sizeof key, cert_compare);
+        if (pcert && !i_set_cert_stuff(ssl, pcert->cer, pcert->key)) {
+            all_ok = 1;
+        }
+        syslog(LOG_DEBUG, "TLS Server Name Indication (SNI) Extension: \"%s\"", servername);
     }
-
-    return SSL_TLSEXT_ERR_OK;
+    syslog(LOG_DEBUG, "Cert matching SNI found? %d", all_ok);
+    return all_ok ? SSL_TLSEXT_ERR_OK : SSL_TLSEXT_ERR_NOACK;
 }
 
 
@@ -349,6 +405,42 @@ static int tls_dump(const char *s, int len)
     return (ret);
 }
 
+
+static int set_cert_stuff1(SSL_CTX *ctx,
+                           const char *cert_file, const char *key_file)
+{
+    int err = 0;
+    if (!cert_file || !key_file) return 1;
+    /* SSL_CTX_use_certificate_chain_file() requires an empty error stack.
+     * To make sure there is no error from previous op, we clear it here...
+     */
+    ERR_clear_error();
+
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_file) <= 0) {
+        err = ERR_get_error();
+        syslog(LOG_ERR, "unable to get certificate from '%s': %s",
+               cert_file, ERR_reason_error_string(err));
+        goto done;
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) <= 0) {
+        err = ERR_get_error();
+        syslog(LOG_ERR, "unable to get private key from '%s': %s",
+               key_file, ERR_reason_error_string(err));
+        goto done;
+    }
+    /* Now we know that a key and cert have been set against
+     * the SSL context */
+    if (!SSL_CTX_check_private_key(ctx)) {
+        err = ERR_get_error();
+        syslog(LOG_ERR, "Private key '%s' does not match public key '%s': %s",
+               key_file, cert_file, ERR_reason_error_string(err));
+        goto done;
+    }
+
+done:
+    return err;
+}
+
  /*
   * Set up the cert things on the server side. We do need both the
   * private key (in key_file) and the cert (in cert_file).
@@ -368,61 +460,16 @@ static int set_cert_stuff(SSL_CTX * ctx,
     char *kf1 = xstrdup(key_file ? key_file : cert_file);
     char *cf2 = strchr(cf1, ',');
     char *kf2 = strchr(kf1, ',');
-    /* SSL_CTX_use_certificate_chain_file() requires an empty error stack.
-     * To make sure there is no error from previous op, we clear it here...
-     */
-    ERR_clear_error();
 
     /* if two comma-separated files provided in cert_file or key_file,
      * split here */
     if (cf2) *cf2++ = '\0';
     if (kf2) *kf2++ = '\0';
 
-    if (SSL_CTX_use_certificate_chain_file(ctx, cf1) <= 0) {
-        err = ERR_get_error();
-        syslog(LOG_ERR, "unable to get certificate from '%s': %s",
-               cf1, ERR_reason_error_string(err));
-        goto done;
-    }
-    if (SSL_CTX_use_PrivateKey_file(ctx, kf1, SSL_FILETYPE_PEM) <= 0) {
-        err = ERR_get_error();
-        syslog(LOG_ERR, "unable to get private key from '%s': %s",
-               kf1, ERR_reason_error_string(err));
-        goto done;
-    }
-    /* Now we know that a key and cert have been set against
-     * the SSL context */
-    if (!SSL_CTX_check_private_key(ctx)) {
-        err = ERR_get_error();
-        syslog(LOG_ERR, "Private key '%s' does not match public key '%s': %s",
-               kf1, cf1, ERR_reason_error_string(err));
-        goto done;
-    }
+    if ((res = set_cert_stuff1(ctx, cf1, kf1))) goto done;
 
     if (cf2) {
-        /* Load second certificate */
-        if (SSL_CTX_use_certificate_chain_file(ctx, cf2) <= 0) {
-            err = ERR_get_error();
-            syslog(LOG_ERR, "unable to get certificate from '%s': %s",
-                   cf2, ERR_reason_error_string(err));
-            goto done;
-        }
-        // if no second key file, use second certificate file
-        if (!kf2) kf2 = cf2;
-        if (SSL_CTX_use_PrivateKey_file(ctx, kf2, SSL_FILETYPE_PEM) <= 0) {
-            err = ERR_get_error();
-            syslog(LOG_ERR, "unable to get private key from '%s': %s",
-                   kf2, ERR_reason_error_string(err));
-            goto done;
-        }
-        /* Now we know that a key and cert have been set against
-         * the SSL context */
-        if (!SSL_CTX_check_private_key(ctx)) {
-            err = ERR_get_error();
-            syslog(LOG_ERR, "Private key '%s' does not match public key '%s': %s",
-                   kf2, cf2, ERR_reason_error_string(err));
-            goto done;
-        }
+        if ((res = set_cert_stuff1(ctx, cf2, kf2))) goto done;
     }
 
     // set success
@@ -695,6 +742,34 @@ done:
     return r;
 }
 
+
+static int cert_write_cn(struct s_cert *pout) {
+    FILE *fp = fopen(pout->cer, "r");
+    if (!fp) goto on_err;
+
+    X509 *cert = PEM_read_X509(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if (!cert) goto on_err;
+
+    X509_NAME *sn = X509_get_subject_name(cert);
+    if (!sn) goto on_err;
+
+    int sz = X509_NAME_get_text_by_NID(sn, NID_commonName, NULL, 0);
+    if (sz < 0) goto on_err;
+    else if (sz == 0) goto on_err;
+
+    pout->dom = malloc(sz + 1);
+    X509_NAME_get_text_by_NID(sn, NID_commonName, pout->dom, sz + 1);
+
+    X509_free(cert);
+    return 0;
+
+on_err:
+    X509_free(cert);
+    return -1;
+}
+
+
  /*
   * This is the setup routine for the SSL server. As smtpd might be called
   * more than once, we only want to do the initialization one time.
@@ -716,13 +791,17 @@ EXPORTED int     tls_init_serverengine(const char *ident,
     const char   *cipher_list;
     const char   *client_ca_dir;
     const char   *client_ca_file;
+    const char   *server_dir;
     const char   *server_ca_file;
     const char   *server_cert_file;
     const char   *server_key_file;
     const char   *crl_file_path;
+    const char   *fext;
     enum enum_value tls_client_certs;
     int server_cipher_order;
     int timeout;
+    DIR *pdr;
+    struct dirent *pde;
 
     if (ret) *ret = s_ctx;
 
@@ -844,14 +923,71 @@ EXPORTED int     tls_init_serverengine(const char *ident,
     }
 
     server_ca_file = config_getstring(IMAPOPT_TLS_SERVER_CA_FILE);
-    server_cert_file = config_getstring(IMAPOPT_TLS_SERVER_CERT);
-    server_key_file = config_getstring(IMAPOPT_TLS_SERVER_KEY);
+    if ((server_dir = config_getstring(IMAPOPT_TLS_SERVER_CERT_DIR)) && strcasecmp(server_dir, "disabled")) {
+        server_cert_file = NULL;
+        server_key_file = NULL;
 
-    if (config_debug) {
-            syslog(
-                LOG_DEBUG, "tls_server_cert=%s tls_server_key=%s",
-                IS_NULL(server_cert_file), IS_NULL(server_key_file)
-            );
+        pdr = opendir(server_dir);
+        if (!pdr) {
+            return -1;
+        }
+        while ((pde = readdir(pdr))) {
+            fext = strrchr(pde->d_name, '.');
+            if (!fext) continue;
+            /* TODO: fs-aware case compare where applicable mayhaps..? */
+            if (strcmp(".crt", fext)) {
+                continue;
+            }
+
+            if (!s_certs_cap) {
+                s_certs_cap = 16;
+                s_certs = malloc(s_certs_cap * sizeof(struct s_cert));
+            } else if (s_certs_cap == s_certs_num) {
+                s_certs_cap <<= 1;
+                s_certs = realloc(s_certs, s_certs_cap * sizeof(struct s_cert));
+            }
+            struct s_cert *pcr = &s_certs[s_certs_num++];
+
+            pcr->cer = malloc(strlen(server_dir) + 1 + strlen(pde->d_name) + 1);
+            sprintf(pcr->cer, "%s/%s", server_dir, pde->d_name);
+
+            pcr->key = (void *)xstrdup(pcr->cer);
+            strcpy(strrchr(pcr->key, '.') + 1, "key");
+
+            if (cert_write_cn(pcr)) {
+                s_certs_num--;
+                syslog(LOG_ERR, "TLS server engine: bad cert:key pair \"%s\":\"%s\"", pcr->cer, pcr->key);
+                free(pcr->cer);
+                free(pcr->key);
+                continue;
+            }
+
+            if (config_debug)
+                syslog(
+                    LOG_DEBUG, "for domain=%s , use server_cert=%s server_key=%s",
+                    IS_NULL(pcr->dom), IS_NULL(pcr->cer), IS_NULL(pcr->key)
+                );
+        }
+        closedir(pdr);
+        if (s_certs_num) {
+            qsort(s_certs, s_certs_num, sizeof(struct s_cert), cert_compare);
+        }
+    }
+    if (!s_certs_num) {
+        server_cert_file = config_getstring(IMAPOPT_TLS_SERVER_CERT);
+        server_key_file = config_getstring(IMAPOPT_TLS_SERVER_KEY);
+
+        if (config_debug) {
+                syslog(
+                    LOG_DEBUG, "tls_server_cert=%s tls_server_key=%s",
+                    IS_NULL(server_cert_file), IS_NULL(server_key_file)
+                );
+        }
+
+        if (!set_cert_stuff(s_ctx, server_cert_file, server_key_file)) {
+            syslog(LOG_ERR, "TLS server engine: cannot load cert/key data, may be a cert/key mismatch?");
+            return (-1);
+        }
     }
 
     /* Only consider adding additional CA certificates -used to verify certificates
@@ -899,11 +1035,6 @@ EXPORTED int     tls_init_serverengine(const char *ident,
 
             return (-1);
         }
-    }
-
-    if (!set_cert_stuff(s_ctx, server_cert_file, server_key_file)) {
-        syslog(LOG_ERR, "TLS server engine: cannot load cert/key data, may be a cert/key mismatch?");
-        return (-1);
     }
 
     SSL_CTX_set_dh_auto(s_ctx, 1);
